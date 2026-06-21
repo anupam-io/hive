@@ -1,0 +1,14 @@
+.env
+.agents
+state.md
+secret.txt
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+auth.json
+service-account-token.txt
+handoff.md
+# hive per-project state
+.hive/

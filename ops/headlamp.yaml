@@ -1,0 +1,90 @@
+# Headlamp — k8s web UI.
+#
+# WARNING: configured for LOCAL DEV ONLY.
+#   - The ServiceAccount has cluster-admin.
+#   - In-cluster mode means anyone who can port-forward the svc has god mode.
+#
+# Access: http://localhost:4001
+# Requires `cloud-provider-kind` running on the host (see `make cloud-provider-kind`).
+# The login screen will show — click through ("in-cluster" mode uses the SA
+# token automatically; no token needs to be pasted).
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: headlamp
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: headlamp-admin
+  namespace: headlamp
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: headlamp-admin
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin
+subjects:
+  - kind: ServiceAccount
+    name: headlamp-admin
+    namespace: headlamp
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: headlamp
+  namespace: headlamp
+  labels:
+    app: headlamp
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: headlamp
+  template:
+    metadata:
+      labels:
+        app: headlamp
+    spec:
+      serviceAccountName: headlamp-admin
+      containers:
+        - name: headlamp
+          image: ghcr.io/headlamp-k8s/headlamp:latest
+          imagePullPolicy: IfNotPresent
+          args:
+            - "-in-cluster"
+            - "-plugins-dir=/headlamp/plugins"
+          ports:
+            - name: http
+              containerPort: 4466
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 4466
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: headlamp
+  namespace: headlamp
+spec:
+  type: LoadBalancer
+  selector:
+    app: headlamp
+  ports:
+    - name: http
+      port: 4001
+      targetPort: 4466

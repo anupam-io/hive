@@ -1,0 +1,12 @@
+{
+  "hooks": {
+    "PreCompact": [
+      {
+        "matcher": "auto",
+        "hooks": [
+          { "type": "command", "command": "bash \"$HIVE_ROOT/ops/driver-precompact.sh\"" }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,713 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Resolve this script's install dir, following symlinks (npm link, npx).
+src="${BASH_SOURCE[0]}"
+while [ -L "$src" ]; do
+  dir="$(cd -P "$(dirname "$src")" && pwd)"
+  src="$(readlink "$src")"
+  [[ $src != /* ]] && src="$dir/$src"
+done
+HIVE_ROOT="$(cd -P "$(dirname "$src")/.." && pwd)"
+
+# Global user state (writable): the fallback .env + per-machine bookkeeping
+# hive keeps regardless of which project you're in. Package files live at
+# $HIVE_ROOT (read-only, wherever npm installed it); user state lives under
+# $HIVE_STATE_DIR (default $HOME/.hive).
+HIVE_STATE_DIR="${HIVE_STATE_DIR:-$HOME/.hive}"
+export HIVE_ROOT HIVE_STATE_DIR
+
+# ── Project config (.hive/config.yaml) ────────────────────────────────────────
+# Per-project config lives at <project>/.hive/config.yaml. hivectl resolves it
+# strictly from $PWD — no walk-up (project boundaries are explicit, not
+# magical). Project-scoped commands (fire, tail, metrics, ui, merge, qa,
+# driver) bail when it's missing; cluster-wide bootstrap commands (init,
+# setup, agent-setup, local-cluster-up/-down, root, help, config) don't.
+HIVE_PROJECT_DIR=""
+HIVE_PROJECT_CFG=""
+hive_find_project() {
+  if [[ -f "$PWD/.hive/config.yaml" ]]; then
+    HIVE_PROJECT_DIR="$PWD"
+    HIVE_PROJECT_CFG="$PWD/.hive/config.yaml"
+    return 0
+  fi
+  return 1
+}
+hive_need_yq() {
+  command -v yq >/dev/null 2>&1 || {
+    echo "hivectl: 'yq' is required to read .hive/config.yaml — install with: brew install yq" >&2
+    exit 1
+  }
+}
+# Read one key from .hive/config.yaml. Usage: $(hive_cfg app), $(hive_cfg cluster.context)
+hive_cfg() {
+  hive_need_yq
+  yq -r ".$1 // \"\"" "$HIVE_PROJECT_CFG"
+}
+# Load every value into HIVE_* env vars so subcommands can pass them along.
+hive_load_config() {
+  hive_find_project || return 1
+  hive_need_yq
+  export HIVE_APP="$(hive_cfg app)"
+  export HIVE_REPO="$(hive_cfg repo)"
+  export HIVE_BASE_BRANCH="$(hive_cfg base_branch)"
+  export HIVE_CLUSTER_CONTEXT="$(hive_cfg cluster.context)"
+  export HIVE_CLUSTER_AGENTS_NS="$(hive_cfg cluster.agents_namespace)"
+  export HIVE_CLUSTER_APP_NS="$(hive_cfg cluster.app_namespace)"
+  export HIVE_CLUSTER_SECRET="$(hive_cfg cluster.secret)"
+  export HIVE_DEFAULT_MODEL="$(hive_cfg defaults.model)"
+  export HIVE_DEFAULT_COST_LIMIT_USD="$(hive_cfg defaults.cost_limit_usd)"
+  # Per-sprint aggregate caps. hive_cfg returns "" for unset keys, so projects
+  # whose config predates these keys fall back to the built-in defaults below.
+  HIVE_SPRINT_BUDGET_USD="$(hive_cfg defaults.sprint_budget_usd)";                 export HIVE_SPRINT_BUDGET_USD="${HIVE_SPRINT_BUDGET_USD:-200}"
+  HIVE_SPRINT_MAX_AGENTS="$(hive_cfg defaults.sprint_max_agents)";                 export HIVE_SPRINT_MAX_AGENTS="${HIVE_SPRINT_MAX_AGENTS:-100}"
+  HIVE_SPRINT_BUDGET_OVERRUN_PCT="$(hive_cfg defaults.sprint_budget_overrun_pct)"; export HIVE_SPRINT_BUDGET_OVERRUN_PCT="${HIVE_SPRINT_BUDGET_OVERRUN_PCT:-50}"
+  HIVE_QA_FOLD_ROUNDS="$(hive_cfg defaults.qa_fold_rounds)";                       export HIVE_QA_FOLD_ROUNDS="${HIVE_QA_FOLD_ROUNDS:-2}"
+  # Per-project run/state dir — all logs, metrics, driver state for THIS
+  # project land here, gitignored. run.sh / agents-logs.sh / agent-metrics.sh
+  # / ops-ui read this when set, falling back to the global $HIVE_STATE_DIR
+  # for legacy installs.
+  export HIVE_PROJECT_DIR
+  export HIVE_AGENTS_DIR="$HIVE_PROJECT_DIR/.hive/runs"
+  mkdir -p "$HIVE_AGENTS_DIR"
+  return 0
+}
+hive_require_project() {
+  hive_load_config || {
+    echo "hivectl: no .hive/config.yaml in $PWD — run \`hivectl init\` first" >&2
+    exit 1
+  }
+}
+# Find the next free TCP port starting from $1 — used by ui/expose so two
+# hive projects can run concurrently without manual port juggling.
+hive_free_port() {
+  local p="$1"
+  while lsof -ti tcp:"$p" >/dev/null 2>&1; do p=$((p + 1)); done
+  echo "$p"
+}
+# Repo slug (owner/name) for `gh -R`. Single source of truth is the project's
+# git remote (kills the repo-slug drift bug); an explicit URL arg wins, and
+# .hive/config.yaml's repo (HIVE_REPO) is the last fallback. Handles both the
+# https://github.com/o/r(.git) and git@github.com:o/r(.git) forms.
+hive_repo_slug() {
+  local url="${1:-}"
+  if [[ -z "$url" ]]; then
+    url="$(git -C "${HIVE_PROJECT_DIR:-$PWD}" remote get-url origin 2>/dev/null || true)"
+    [[ -z "$url" ]] && url="${HIVE_REPO:-}"
+  fi
+  printf '%s' "$url" | sed -E 's|^.*github\.com[:/]||; s|\.git$||'
+}
+# The status:* values an issue/PR may carry (mutex — exactly one at a time).
+HIVE_STATUSES="ready in-progress in-review changes-requested done needs-human"
+# Set the single status:* label on an issue, removing every OTHER status:* in
+# the SAME gh call. Central so `hivectl merge` and `hivectl status` enforce the mutex
+# identically (the "forgot to remove the old status label" bug, in one place).
+# Args: <slug> <issue-number> <bare-status>.
+hive_set_status() {
+  local slug="$1" num="$2" want="$3" s
+  local args=(--add-label "status:$want")
+  for s in $HIVE_STATUSES; do
+    [[ "$s" == "$want" ]] && continue
+    args+=(--remove-label "status:$s")
+  done
+  gh -R "$slug" issue edit "$num" "${args[@]}"
+}
+
+usage() {
+  cat <<EOF
+hivectl — coding-agent fleet CLI
+
+Usage: hivectl <command> [args]
+
+Fleet (require .hive/config.yaml — run \`hivectl init\` first):
+  fire <ISSUE> --type=<T> [--repo=<URL>] [--base=<BR>]
+                                       Fire a worker against GitHub ISSUE (number or "issue-N")
+                                       T: feature-implementation|bug-fix|improvement|research
+  qa --url=<U> [--target=<ISSUE>]      Fire a qa agent against a deployed URL
+  merge <ISSUE> [--repo=<URL>] [--base=<BR>] [--force]
+                                       Merge agent/issue-<N>'s reviewed PR locally (gh, no pod); refuses unless status:in-review
+  status <ISSUE> <STATUS>              Set an issue's status:* label, enforcing the mutex (STATUS: ready|in-progress|in-review|changes-requested|done|needs-human)
+  tail <ISSUE>                         Live-tail running pod stdout (filtered by app=)
+  logs                                 List this project's run dirs
+  metrics [ISSUE]                      Cost/tokens/duration table
+  ui                                   Open agent run-analytics UI (port auto-picks from 8001)
+  expose                               Port-forward prometheus + headlamp + the configured app, AND start hivectl ui (one process — Ctrl-C stops all)
+
+Driver (local claude session, no cluster needed for plan/triage):
+  driver [--once] [--budget=<USD>] [--sleep=<s>] [--repo=<path>]
+                                       AUTO (default): unattended loop — picks the current sprint and
+                                       drives it to completion, streaming all output; relaunches a fresh
+                                       session on each context-limit handoff / per-session budget cap.
+                                       --once     one session, no relaunch
+                                       --budget   per-session \$ cap (default 10)
+                                       --interactive   old human-driven session (waits for orders)
+
+Project (run inside a project dir):
+  init                                 Scaffold .hive/config.yaml in cwd (idempotent)
+  config [get <k> | set <k>=<v>]       Print resolved config; or read/edit one key
+  labels [sync | list]                 Sync $HIVE_ROOT/.claude/labels.md into the project's GitHub repo (idempotent)
+  gc [--age=30m] [--all]               Delete this project's Sandbox CRs older than --age in the agents namespace
+
+Local cluster lifecycle (Mac dev only — minikube + vfkit):
+  local-cluster-up                     Spin up the local 'local-cluster' minikube cluster (kubectl context: local-cluster)
+  local-cluster-down                   Delete the local 'local-cluster' minikube cluster
+
+Infra setup (one-time):
+  bootstrap                            One-shot fresh-machine setup: doctor → local-cluster-up → setup (stops on first failure)
+  doctor                               Check host CLIs (kubectl, docker, yq, jq, gh, envsubst, claude, minikube) and print install hints
+  setup                                Install metrics-server + prometheus + sandbox CRDs + headlamp + hive-gc
+  agent-setup                          Build image + create k8s secret from .env
+
+Misc:
+  version                              Print the hive version (from package.json)
+  root                                 Print resolved install dir
+  help                                 This message
+EOF
+}
+
+cmd="${1:-help}"
+shift || true
+
+case "$cmd" in
+  fire)
+    hive_require_project
+    issue="${1:-}"
+    if [[ -z "$issue" || "$issue" == --* ]]; then
+      echo "usage: hivectl fire <ISSUE> --type=<T> [--repo=<URL>] [--base=<BR>]" >&2
+      exit 1
+    fi
+    shift
+    type=""; repo=""; base=""
+    for a in "$@"; do
+      case "$a" in
+        --type=*) type="${a#--type=}";;
+        --repo=*) repo="${a#--repo=}";;
+        --base=*) base="${a#--base=}";;
+        *) echo "unknown flag: $a" >&2; exit 1;;
+      esac
+    done
+    [[ -z "$type" ]] && { echo "--type is required" >&2; exit 1; }
+    # Repo precedence: --repo flag > .hive/config.yaml's repo (HIVE_REPO).
+    # Never fall through to the Makefile's stale REPO default for a real fire.
+    eff_repo="${repo:-$HIVE_REPO}"
+    exec make -C "$HIVE_ROOT" agent-fire \
+      ISSUE="$issue" TYPE="$type" \
+      ${eff_repo:+REPO="$eff_repo"} ${base:+BASE="$base"}
+    ;;
+
+  qa)
+    hive_require_project
+    url=""; target=""
+    for a in "$@"; do
+      case "$a" in
+        --url=*) url="${a#--url=}";;
+        --target=*) target="${a#--target=}";;
+        *) echo "unknown flag: $a" >&2; exit 1;;
+      esac
+    done
+    [[ -z "$url" ]] && { echo "usage: hivectl qa --url=<URL> [--target=<ISSUE>]" >&2; exit 1; }
+    exec make -C "$HIVE_ROOT" qa-fire \
+      URL="$url" ${target:+TARGET="$target"} ${HIVE_REPO:+REPO="$HIVE_REPO"}
+    ;;
+
+  merge)
+    # Merge agent/issue-N's reviewed PR — LOCALLY via gh, no pod. The old
+    # `pr-merge` pod fire (a whole task type that half-failed on what a local
+    # `gh pr merge` does directly) is gone; this is the single safe merge
+    # surface (the driver calls `hivectl merge`, never raw `gh pr merge`). The
+    # guardrails — slug-from-remote, the status:in-review gate, the status
+    # mutex on success — live HERE so every merge enforces them in one place.
+    hive_require_project
+    issue="${1:-}"
+    [[ -z "$issue" ]] && { echo "usage: hivectl merge <ISSUE> [--repo=<URL>] [--base=<BR>] [--force]" >&2; exit 1; }
+    shift
+    repo=""; base=""; force=0
+    for a in "$@"; do
+      case "$a" in
+        --repo=*) repo="${a#--repo=}";;
+        --base=*) base="${a#--base=}";;
+        --force)  force=1;;
+        *) echo "unknown flag: $a" >&2; exit 1;;
+      esac
+    done
+    command -v gh >/dev/null 2>&1 || { echo "merge: gh CLI not found — run \`hivectl doctor\`" >&2; exit 1; }
+    command -v jq >/dev/null 2>&1 || { echo "merge: jq not found — run \`hivectl doctor\`" >&2; exit 1; }
+    # Normalize "issue-42" / "#42" / "42" → bare number.
+    num="${issue#issue-}"; num="${num##*#}"
+    case "$num" in ''|*[!0-9]*) echo "merge: ISSUE must be a number (got '$issue')" >&2; exit 1;; esac
+    branch="agent/issue-${num}"
+    slug="$(hive_repo_slug "$repo")"
+    [[ -z "$slug" ]] && { echo "merge: cannot resolve repo slug (no git remote, no config repo, no --repo)" >&2; exit 1; }
+    base="${base:-${HIVE_BASE_BRANCH:-main}}"
+
+    # 1. Resolve the open PR for agent/issue-N.
+    pr_json="$(gh -R "$slug" pr view "$branch" --json number,state,mergeStateStatus,statusCheckRollup 2>/dev/null || true)"
+    [[ -z "$pr_json" ]] && { echo "merge: no PR found for $branch in $slug" >&2; exit 1; }
+    pr_num="$(printf '%s' "$pr_json" | jq -r '.number')"
+    pr_state="$(printf '%s' "$pr_json" | jq -r '.state')"
+    [[ "$pr_state" != "OPEN" ]] && { echo "merge: PR #$pr_num for $branch is $pr_state, not OPEN — nothing to merge" >&2; exit 1; }
+
+    # 2. Gate: the issue must be status:in-review (the worker's in-pod review
+    # returned PASS). The driver must never ship un-reviewed work; --force is
+    # the human escape hatch.
+    labels="$(gh -R "$slug" issue view "$num" --json labels -q '[.labels[].name]|join(",")' 2>/dev/null || echo "")"
+    if [[ "$force" != "1" && ",$labels," != *",status:in-review,"* ]]; then
+      echo "merge: issue #$num is not status:in-review (labels: ${labels:-none}) — refusing." >&2
+      echo "       The PR's in-pod review must PASS first. Override with --force if you know it's safe." >&2
+      exit 1
+    fi
+
+    # 3. Gate: refuse on a failing check. Pending/empty is allowed — many
+    # projects have no CI, and the in-review label is the real gate.
+    failed="$(printf '%s' "$pr_json" | jq -r '[.statusCheckRollup[]? | select(((.conclusion // .state) // "") | test("FAIL|ERROR|CANCEL|TIMED_OUT";"i"))] | length' 2>/dev/null || echo 0)"
+    if [[ "$force" != "1" && "${failed:-0}" -gt 0 ]]; then
+      echo "merge: PR #$pr_num has $failed failing check(s) — refusing. Override with --force." >&2
+      exit 1
+    fi
+
+    # 4. Merge (squash + delete-branch — the fleet's convention). GitHub refuses
+    # an un-mergeable branch; that surfaces as the re-fire-to-rebase signal below.
+    echo "[merge] $slug PR #$pr_num ($branch) → $base  [squash]"
+    if ! gh -R "$slug" pr merge "$pr_num" --squash --delete-branch; then
+      echo "merge: \`gh pr merge\` failed for PR #$pr_num — most likely a rebase conflict against $base." >&2
+      echo "       Re-fire a worker to rebase, then re-run \`hivectl merge $num\`." >&2
+      exit 1
+    fi
+
+    # 5. Status mutex — set the issue to status:done, dropping every other
+    # status:* in the SAME call so no multi-status issue is left behind. The PR
+    # is already merged at this point, so a label failure is non-fatal — but say
+    # so honestly rather than printing a "→ status:done" line that didn't happen.
+    if hive_set_status "$slug" "$num" done >/dev/null 2>&1; then
+      echo "[merge] merged PR #$pr_num; issue #$num → status:done"
+    else
+      echo "[merge] merged PR #$pr_num, but could NOT set issue #$num → status:done" >&2
+      echo "        Fix it with \`hivectl status $num done\` (labels synced? \`hivectl labels sync\`)." >&2
+    fi
+    ;;
+
+  status)
+    # Move an issue to a single status:* label, enforcing the mutex (remove
+    # every other status:* in the same call) and resolving the repo slug from
+    # the git remote. This is the safe wrapper for what the driver used to do
+    # with raw `gh issue edit --add-label/--remove-label` (and kept getting the
+    # mutex / slug wrong). Reads + comments stay raw `gh`; mutations come here.
+    hive_require_project
+    issue="${1:-}"; newstatus="${2:-}"
+    if [[ -z "$issue" || -z "$newstatus" ]]; then
+      echo "usage: hivectl status <ISSUE> <$(echo "$HIVE_STATUSES" | tr ' ' '|')> [--repo=<URL>]" >&2; exit 1
+    fi
+    shift 2
+    repo=""
+    for a in "$@"; do
+      case "$a" in
+        --repo=*) repo="${a#--repo=}";;
+        *) echo "unknown flag: $a" >&2; exit 1;;
+      esac
+    done
+    command -v gh >/dev/null 2>&1 || { echo "status: gh CLI not found — run \`hivectl doctor\`" >&2; exit 1; }
+    num="${issue#issue-}"; num="${num##*#}"
+    case "$num" in ''|*[!0-9]*) echo "status: ISSUE must be a number (got '$issue')" >&2; exit 1;; esac
+    want="${newstatus#status:}"
+    valid=0; for s in $HIVE_STATUSES; do [[ "$s" == "$want" ]] && valid=1; done
+    [[ "$valid" = 1 ]] || { echo "status: '$newstatus' is not a valid status ($(echo "$HIVE_STATUSES" | tr ' ' '|'))" >&2; exit 1; }
+    slug="$(hive_repo_slug "$repo")"
+    [[ -z "$slug" ]] && { echo "status: cannot resolve repo slug (no git remote, no config repo, no --repo)" >&2; exit 1; }
+    if ! hive_set_status "$slug" "$num" "$want" >/dev/null; then
+      echo "status: gh issue edit failed for #$num (label missing in repo? run \`hivectl labels sync\`)" >&2; exit 1
+    fi
+    echo "[status] issue #$num → status:$want  (mutex: all other status:* removed)"
+    ;;
+
+  tail)
+    hive_require_project
+    issue="${1:-}"
+    [[ -z "$issue" ]] && { echo "usage: hivectl tail <ISSUE>" >&2; exit 1; }
+    exec make -C "$HIVE_ROOT" agent-tail ISSUE="$issue"
+    ;;
+
+  logs)
+    hive_require_project
+    exec make -C "$HIVE_ROOT" agent-logs
+    ;;
+
+  metrics)
+    hive_require_project
+    issue="${1:-}"
+    exec make -C "$HIVE_ROOT" agent-metrics ${issue:+ISSUE="$issue"}
+    ;;
+
+  ui)
+    hive_require_project
+    port="$(hive_free_port "${AGENT_UI_PORT:-8001}")"
+    # Also expose the app's web UI locally with a SELF-HEALING forward (survives
+    # pod rolls) so the local driver / human can watch the running app next to
+    # the analytics UI — no second command. Pods already reach the app in-cluster
+    # at <svc>.<ns>.svc.cluster.local; this is just the Mac-side view. Overridable
+    # via APP_WEB_NS/SVC/PORT; skipped if the svc is absent or the port is taken.
+    APP_WEB_NS="${APP_WEB_NS:-prod}"; APP_WEB_SVC="${APP_WEB_SVC:-web}"; APP_WEB_PORT="${APP_WEB_PORT:-3000}"
+    WEB_PF_PID=""
+    if kubectl -n "$APP_WEB_NS" get svc "$APP_WEB_SVC" >/dev/null 2>&1; then
+      if lsof -iTCP:"$APP_WEB_PORT" -sTCP:LISTEN -n -P >/dev/null 2>&1; then
+        echo "[ui] :$APP_WEB_PORT already in use — leaving the app web forward to whatever holds it"
+      else
+        ( while true; do kubectl -n "$APP_WEB_NS" port-forward "svc/$APP_WEB_SVC" "$APP_WEB_PORT:$APP_WEB_PORT" >/dev/null 2>&1; sleep 1; done ) &
+        WEB_PF_PID=$!
+        echo "[ui] app web UI       -> http://localhost:$APP_WEB_PORT (self-healing forward)"
+      fi
+    fi
+    UI_PID=""
+    cleanup_ui() {
+      # Kill the analytics server explicitly — don't rely on it self-handling
+      # SIGINT (a child whose SIGINT is inherited-ignored would otherwise leak
+      # the port on Ctrl-C). SIGTERM takes it down regardless of disposition.
+      [ -n "$UI_PID" ] && kill "$UI_PID" 2>/dev/null
+      [ -n "$WEB_PF_PID" ] && kill "$WEB_PF_PID" 2>/dev/null
+      pkill -f "port-forward svc/$APP_WEB_SVC $APP_WEB_PORT:$APP_WEB_PORT" 2>/dev/null
+    }
+    trap cleanup_ui EXIT INT TERM
+    echo "[ui] agent analytics  -> http://localhost:$port (Ctrl-C to stop both)"
+    AGENT_UI_PORT="$port" python3 "$HIVE_ROOT/ops-ui/app.py" &
+    UI_PID=$!
+    wait "$UI_PID" 2>/dev/null || true
+    ;;
+
+  expose)
+    # One command, one terminal: prometheus + headlamp + the configured app
+    # are kubectl-port-forwarded into the background, then hivectl ui runs in the
+    # foreground. Ctrl-C (SIGINT) tears every forward down via the EXIT trap so
+    # the user never has to chase stray kubectl processes.
+    hive_require_project
+    ctx_arg=""
+    [[ -n "${HIVE_CLUSTER_CONTEXT:-}" ]] && ctx_arg="--context=$HIVE_CLUSTER_CONTEXT"
+    pids=()
+    cleanup() {
+      echo
+      echo "[expose] stopping forwards…"
+      for p in "${pids[@]}"; do kill "$p" 2>/dev/null || true; done
+      wait 2>/dev/null || true
+    }
+    trap cleanup EXIT INT TERM
+
+    # Start one port-forward in the background. Local port auto-picks from the
+    # preferred number so two hive projects on the same machine don't collide.
+    forward() {  # forward <label> <namespace> <service> <remote_port> <preferred_local>
+      local label="$1" ns="$2" svc="$3" remote="$4" preferred="$5"
+      local local_port; local_port="$(hive_free_port "$preferred")"
+      # Probe the service exists before forwarding so an absent prom/headlamp
+      # surfaces as a one-line WARN instead of a silent dead port-forward.
+      if ! kubectl $ctx_arg -n "$ns" get "svc/$svc" >/dev/null 2>&1; then
+        printf '  %-12s WARN: svc/%s missing in ns/%s — skipping\n' "$label" "$svc" "$ns"
+        return 0
+      fi
+      kubectl $ctx_arg -n "$ns" port-forward "svc/$svc" "$local_port:$remote" >/dev/null 2>&1 &
+      pids+=("$!")
+      printf '  %-12s http://localhost:%s\n' "$label" "$local_port"
+    }
+
+    echo "[expose] starting forwards (Ctrl-C stops everything)…"
+    forward prometheus monitoring prometheus 9090 9090
+    forward headlamp   headlamp   headlamp   4001 4001
+
+    # Optional: app port-forward. Reads expose.app.{namespace,service,port}
+    # from .hive/config.yaml. Absent → just prom + headlamp + ui.
+    app_ns="$(hive_cfg expose.app.namespace)"
+    app_svc="$(hive_cfg expose.app.service)"
+    app_port="$(hive_cfg expose.app.port)"
+    if [[ -n "$app_ns" && -n "$app_svc" && -n "$app_port" ]]; then
+      forward "${HIVE_APP:-app}" "$app_ns" "$app_svc" "$app_port" "$app_port"
+    else
+      printf '  %-12s (configure expose.app in .hive/config.yaml to expose your app)\n' "${HIVE_APP:-app}"
+    fi
+
+    ui_port="$(hive_free_port "${AGENT_UI_PORT:-8001}")"
+    printf '  %-12s http://localhost:%s\n' "hivectl ui" "$ui_port"
+    echo
+    # Foreground — Ctrl-C lands here and the trap cleans up the forwards.
+    AGENT_UI_PORT="$ui_port" python3 "$HIVE_ROOT/ops-ui/app.py"
+    ;;
+
+  init)
+    hive_need_yq
+    if [[ -f "$PWD/.hive/config.yaml" ]]; then
+      echo "hivectl init: $PWD/.hive/config.yaml already exists — no changes" >&2
+      exit 0
+    fi
+    tmpl_dir="$HIVE_ROOT/assets/hive"
+    [[ -d "$tmpl_dir" ]] || { echo "hivectl init: template missing at $tmpl_dir" >&2; exit 1; }
+    mkdir -p "$PWD/.hive"
+    # Inferred substitutions — edit later with `hivectl config set`.
+    APP="$(basename "$PWD")"
+    REPO="$(git -C "$PWD" remote get-url origin 2>/dev/null || echo '')"
+    CLUSTER_CONTEXT="$(kubectl config current-context 2>/dev/null || echo '')"
+    GENERATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    # Walk the template tree recursively and copy each file, substituting
+    # ${PLACEHOLDER}s. find -type f handles nested dirs (e.g. kanban/) for free.
+    export APP REPO CLUSTER_CONTEXT GENERATED_AT
+    while IFS= read -r -d '' src; do
+      rel="${src#$tmpl_dir/}"
+      dst="$PWD/.hive/$rel"
+      mkdir -p "$(dirname "$dst")"
+      envsubst < "$src" > "$dst"
+    done < <(find "$tmpl_dir" -type f -print0)
+    # The state dir self-ignores so nothing in .hive/ is ever committed, even
+    # when the project has no root .gitignore to fall back on.
+    printf '%s\n' '# .hive/ is hive-owned per-project state — never commit any of it.' '*' > "$PWD/.hive/.gitignore"
+    # Ensure the project's own .gitignore excludes .hive/ at the dir level too.
+    if [[ -f "$PWD/.gitignore" ]]; then
+      if ! grep -qE '^\.hive/?$' "$PWD/.gitignore"; then
+        printf '\n# hive per-project state\n.hive/\n' >> "$PWD/.gitignore"
+        echo "hivectl init: appended '.hive/' to $PWD/.gitignore"
+      fi
+    fi
+    echo "hivectl init: scaffolded $PWD/.hive/ from $tmpl_dir"
+    echo "  app:     $APP"
+    echo "  repo:    ${REPO:-<unset>}"
+    echo "  cluster: ${CLUSTER_CONTEXT:-<unset, will use kubectl current-context>}"
+    echo
+    echo "  edit:    hivectl config set <key>=<value>   (e.g. hivectl config set base_branch=develop)"
+    echo "  show:    hivectl config"
+    echo "  next:    hivectl doctor   # check host CLIs are installed"
+    ;;
+
+  config)
+    sub="${1:-}"; shift || true
+    case "$sub" in
+      ""|show)
+        hive_require_project
+        echo "# $HIVE_PROJECT_CFG"
+        cat "$HIVE_PROJECT_CFG"
+        ;;
+      get)
+        hive_require_project
+        key="${1:-}"
+        [[ -z "$key" ]] && { echo "usage: hivectl config get <key>" >&2; exit 1; }
+        hive_cfg "$key"
+        ;;
+      set)
+        hive_require_project
+        arg="${1:-}"
+        [[ "$arg" == *=* ]] || { echo "usage: hivectl config set <key>=<value>" >&2; exit 1; }
+        key="${arg%%=*}"; val="${arg#*=}"
+        yq -i "(.$key) = \"$val\"" "$HIVE_PROJECT_CFG"
+        echo "hivectl config: set $key = $val"
+        ;;
+      *) echo "usage: hivectl config [get <k> | set <k>=<v>]" >&2; exit 1 ;;
+    esac
+    ;;
+
+  local-cluster-up)
+    exec make -C "$HIVE_ROOT" local-cluster-up
+    ;;
+
+  local-cluster-down)
+    exec make -C "$HIVE_ROOT" local-cluster-down
+    ;;
+
+  setup)
+    exec make -C "$HIVE_ROOT" setup
+    ;;
+
+  bootstrap)
+    # One-shot fresh-machine setup: chain the cluster-wide steps in order,
+    # stopping on the first failure. Each step is a normal hivectl subcommand.
+    steps=(doctor local-cluster-up setup)
+    n=0; total=${#steps[@]}
+    for step in "${steps[@]}"; do
+      n=$((n + 1))
+      echo "[bootstrap] step $n/$total: $step"
+      if ! "$0" "$step"; then
+        echo "bootstrap: step $n ($step) failed — fix and re-run \`hivectl bootstrap\`" >&2
+        exit 1
+      fi
+    done
+    echo
+    echo "[bootstrap] done — next: cd into your app repo and run \`hivectl init\`"
+    ;;
+
+  agent-setup)
+    hive_require_project
+    SECRET_NAME="$HIVE_CLUSTER_SECRET" \
+      exec make -C "$HIVE_ROOT" agent-setup
+    ;;
+
+  driver)
+    # Default is AUTO: an unattended supervisor loop that picks the current
+    # sprint and drives it to completion, streaming all output and relaunching
+    # a fresh session on each context-limit handoff / budget cap (see
+    # ops/driver-loop.sh). Use --interactive for the old human-driven session.
+    hive_require_project
+    repo="$HIVE_PROJECT_DIR"
+    mode="auto"
+    once="0"
+    budget="${SP_DRIVER_BUDGET_USD:-10}"
+    sleep_s="${SP_DRIVER_SLEEP:-}"   # empty = self-pace via NEXT_WAIT_S (60s floor/600 cap); set (env or --sleep=) forces a fixed pause
+    for a in "$@"; do
+      case "$a" in
+        --repo=*)              repo="${a#--repo=}";;
+        --interactive|--repl)  mode="interactive";;
+        --once)                once="1";;
+        --budget=*)            budget="${a#--budget=}";;
+        --sleep=*)             sleep_s="${a#--sleep=}";;
+        *) echo "unknown flag: $a" >&2; exit 1;;
+      esac
+    done
+    [[ -d "$repo" ]] || { echo "driver: repo dir not found: $repo" >&2; exit 1; }
+    [[ -f "$HIVE_ROOT/.claude/agents/driver.md" ]] || {
+      echo "driver: $HIVE_ROOT/.claude/agents/driver.md not found — driver agent definition missing from hive" >&2
+      exit 1
+    }
+    command -v claude >/dev/null || { echo "driver: claude CLI not found in PATH" >&2; exit 1; }
+    cd "$repo"
+    if [[ "$mode" == "interactive" ]]; then
+      exec claude --dangerously-skip-permissions --model "${HIVE_DRIVER_MODEL:-claude-opus-4-8}" --add-dir "$HIVE_ROOT" --append-system-prompt "$(cat "$HIVE_ROOT/.claude/agents/driver.md")" "Your driver rules have been appended to your system prompt. The hive install dir ($HIVE_ROOT) is on your add-dir list — skills under \$HIVE_ROOT/.claude/skills/ (like 'sprint') are available; Read them on demand when the user invokes one. First task: run the Session bootstrap from your driver.md — read .hive/config.yaml, surface it (one-line: project=$HIVE_APP repo=$HIVE_REPO cluster=$HIVE_CLUSTER_CONTEXT secret=$HIVE_CLUSTER_SECRET), check cluster reachability, read the latest .hive/handoff/sprint-*.md, read the app repo's CLAUDE.md. Then surface current fleet state (open PRs, GH issues, recent merges), flag any visible drift, and wait for orders."
+    fi
+    # auto (default) — hand off to the supervisor loop, wrapped in the keypress
+    # control layer (h=handoff+exit, m=mute, ↑/↓=voice speed). The wrapper runs
+    # driver-loop.sh in the background and reads keys; with no tty it just execs
+    # the loop directly.
+    exec env \
+      SP_DRIVER_BUDGET_USD="$budget" \
+      SP_DRIVER_SLEEP="$sleep_s" \
+      SP_DRIVER_ONCE="$once" \
+      bash "$HIVE_ROOT/ops/driver-keys.sh" "$repo"
+    ;;
+
+  doctor)
+    # Host-dep preflight. Reports per-tool; exits 1 if any required tool missing.
+    # minikube + vfkit are optional (only needed for `hivectl local-cluster-up`).
+    ok=1; opt_missing=0
+    has() { command -v "$1" >/dev/null 2>&1; }
+    say_ok()   { printf "  \033[32m✓\033[0m %-9s\n" "$1"; }
+    say_miss() { printf "  \033[31m✗\033[0m %-9s — install: %s\n" "$1" "$2"; ok=0; }
+    say_opt()  { printf "  \033[33m·\033[0m %-9s — optional (for $3): %s\n" "$1" "$2" "$3"; opt_missing=1; }
+    echo "hivectl doctor: checking host CLIs"
+    has kubectl  && say_ok kubectl  || say_miss kubectl  "brew install kubectl"
+    has docker   && say_ok docker   || say_miss docker   "brew install --cask docker"
+    has jq       && say_ok jq       || say_miss jq       "brew install jq"
+    has yq       && say_ok yq       || say_miss yq       "brew install yq"
+    has gh       && say_ok gh       || say_miss gh       "brew install gh"
+    has envsubst && say_ok envsubst || say_miss envsubst "brew install gettext"
+    has claude   && say_ok claude   || say_miss claude   "npm i -g @anthropic-ai/claude-code"
+    has minikube && say_ok minikube || say_opt  minikube "brew install minikube" "local-cluster-up"
+    has vfkit    && say_ok vfkit    || say_opt  vfkit    "brew install vfkit"    "local-cluster-up"
+    echo
+    if [[ "$ok" = 0 ]]; then
+      echo "hivectl doctor: required tools missing above — install and re-run." >&2
+      exit 1
+    fi
+    [[ "$opt_missing" = 1 ]] && echo "hivectl doctor: all required tools present (some optional missing)"
+    [[ "$opt_missing" = 0 ]] && echo "hivectl doctor: all tools present"
+    ;;
+
+  labels)
+    hive_require_project
+    sub="${1:-sync}"; shift || true
+    case "$sub" in
+      sync)
+        # Read the canonical label dictionary from $HIVE_ROOT/.claude/labels.md
+        # and call `gh label create --force` for each row. --force makes it
+        # idempotent: create on first run, update color/description thereafter.
+        # Only labels managed by hive (status:*, type:*, sprint-N) are touched.
+        [[ -f "$HIVE_ROOT/.claude/labels.md" ]] || {
+          echo "labels sync: $HIVE_ROOT/.claude/labels.md missing" >&2; exit 1;
+        }
+        command -v gh >/dev/null 2>&1 || { echo "labels sync: gh CLI not found — run \`hivectl doctor\`" >&2; exit 1; }
+        repo_url="$HIVE_REPO"
+        [[ -z "$repo_url" ]] && { echo "labels sync: 'repo' not set in .hive/config.yaml" >&2; exit 1; }
+        # gh wants <owner>/<name>, not the clone URL. Strip prefix + .git suffix.
+        repo_slug="$(echo "$repo_url" | sed -E 's|^.*github\.com[:/]||; s|\.git$||')"
+        echo "[labels] syncing $HIVE_ROOT/.claude/labels.md → $repo_slug"
+        # Parse `| \`label\` | \`#color\` | description |` rows from the three managed tables.
+        awk -F'|' '
+          /^\| `[a-z][a-z0-9:_-]+` *\| `#[0-9A-Fa-f]+` *\|/ {
+            gsub(/`/, "")
+            for (i=1;i<=NF;i++) { gsub(/^[[:space:]]+|[[:space:]]+$/, "", $i) }
+            printf "%s\t%s\t%s\n", $2, $3, $4
+          }
+        ' "$HIVE_ROOT/.claude/labels.md" | while IFS=$'\t' read -r name color desc; do
+          if gh -R "$repo_slug" label create "$name" \
+            --color "${color#\#}" --description "$desc" --force >/dev/null 2>&1; then
+            echo "  ✓ $name"
+          else
+            echo "  ✗ $name (gh error)"
+          fi
+        done
+        ;;
+      list)
+        command -v gh >/dev/null 2>&1 || { echo "labels list: gh CLI not found" >&2; exit 1; }
+        repo_slug="$(echo "$HIVE_REPO" | sed -E 's|^.*github\.com[:/]||; s|\.git$||')"
+        exec gh -R "$repo_slug" label list
+        ;;
+      *) echo "usage: hivectl labels [sync | list]" >&2; exit 1 ;;
+    esac
+    ;;
+
+  gc)
+    # GC dead Sandbox CRs in this project's agents namespace.
+    # Defaults: --age=30m, scoped to app=$HIVE_APP. Without this, completed
+    # sandboxes pile up and eventually fill the cluster's disk.
+    hive_require_project
+    age="30m"; do_all=0
+    for a in "$@"; do
+      case "$a" in
+        --age=*) age="${a#--age=}";;
+        --all)   do_all=1;;
+        *) echo "unknown flag: $a" >&2; exit 1;;
+      esac
+    done
+    NS="${HIVE_CLUSTER_AGENTS_NS:-agents}"
+    ctx_arg=()
+    [[ -n "${HIVE_CLUSTER_CONTEXT:-}" ]] && ctx_arg=(--context "$HIVE_CLUSTER_CONTEXT")
+    sel="app=$HIVE_APP"
+    if [[ "$do_all" = 1 ]]; then
+      printf "[gc] delete ALL Sandbox CRs in %s (app=%s)? [y/N] " "$NS" "$HIVE_APP" >&2
+      read -r yn
+      [[ "$yn" =~ ^[Yy]$ ]] || { echo "[gc] aborted"; exit 1; }
+      kubectl "${ctx_arg[@]}" -n "$NS" delete sandbox -l "$sel" --ignore-not-found 2>&1 || true
+      exit 0
+    fi
+    # Convert "30m" / "1h" / "90s" → seconds.
+    case "$age" in
+      *s) age_sec="${age%s}";;
+      *m) age_sec=$(( ${age%m} * 60 ));;
+      *h) age_sec=$(( ${age%h} * 3600 ));;
+      *)  echo "[gc] invalid --age '$age' (use Ns, Nm, or Nh)" >&2; exit 1;;
+    esac
+    # ISO-8601 UTC cutoff. macOS `date -v` and GNU `date -d` both supported.
+    if cutoff="$(date -u -v-"${age_sec}"S +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)"; then :; else
+      cutoff="$(date -u -d "@$(( $(date +%s) - age_sec ))" +%Y-%m-%dT%H:%M:%SZ)"
+    fi
+    echo "[gc] ns=$NS  app=$HIVE_APP  cutoff=$cutoff (age > $age)"
+    victims="$(kubectl "${ctx_arg[@]}" -n "$NS" get sandbox -l "$sel" -o json 2>/dev/null \
+      | jq -r --arg cutoff "$cutoff" '.items[]? | select(.metadata.creationTimestamp < $cutoff) | .metadata.name')"
+    if [[ -z "$victims" ]]; then
+      echo "[gc] nothing to delete"
+      exit 0
+    fi
+    echo "$victims" | while read -r name; do
+      kubectl "${ctx_arg[@]}" -n "$NS" delete sandbox "$name" --ignore-not-found >/dev/null \
+        && echo "  ✓ $name" \
+        || echo "  ✗ $name"
+    done
+    ;;
+
+  version|-v|--version)
+    awk -F'"' '/"version"/{print $4; exit}' "$HIVE_ROOT/package.json"
+    ;;
+
+  root)
+    echo "$HIVE_ROOT"
+    ;;
+
+  help|-h|--help|"")
+    usage
+    ;;
+
+  *)
+    echo "unknown command: $cmd" >&2
+    echo >&2
+    usage >&2
+    exit 1
+    ;;
+esac

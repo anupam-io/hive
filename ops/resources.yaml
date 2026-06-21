@@ -1,0 +1,118 @@
+# In-cluster shared resources: Postgres with a persistent volume.
+#
+# StatefulSet (not Deployment) — gives a stable name (postgres-0) and proper
+# PVC lifecycle. The volumeClaimTemplate at the bottom is the bit that makes
+# data survive pod restarts AND StatefulSet deletes: the PVC persists until you
+# explicitly `kubectl -n resources delete pvc data-postgres-0`.
+#
+# Default creds: postgres / postgres / db=app. Change for anything serious.
+# Access:
+#   in-cluster: postgres.resources.svc.cluster.local:5432
+#   from Mac:   kubectl -n resources port-forward svc/postgres 5432:5432
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: resources
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: postgres
+  namespace: resources
+type: Opaque
+stringData:
+  POSTGRES_USER: test
+  POSTGRES_PASSWORD: test
+  POSTGRES_DB: test
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: resources
+  labels:
+    app: postgres
+spec:
+  clusterIP: None        # headless — required for StatefulSet stable DNS
+  selector:
+    app: postgres
+  ports:
+    - name: pg
+      port: 5432
+      targetPort: 5432
+---
+# External access. LoadBalancer + cloud-provider-kind => localhost:5432 on the Mac.
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-lb
+  namespace: resources
+  labels:
+    app: postgres
+spec:
+  type: LoadBalancer
+  selector:
+    app: postgres
+  ports:
+    - name: pg
+      port: 5432
+      targetPort: 5432
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: resources
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16
+          ports:
+            - name: pg
+              containerPort: 5432
+          envFrom:
+            - secretRef:
+                name: postgres
+          env:
+            # Subdir so postgres doesn't trip on lost+found at the volume root.
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "postgres"]
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "postgres"]
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "1"
+              memory: "1Gi"
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: "10Gi"

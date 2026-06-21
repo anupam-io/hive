@@ -1,0 +1,100 @@
+# hive-gc — auto-GC for orphaned/completed Sandbox CRs in the `agents` namespace.
+#
+# Per-fire sandboxes set `shutdownPolicy: Delete`, which removes the POD when its
+# container exits — but the Sandbox CR itself stays around. Without GC the
+# `agents/` namespace slowly fills with hundreds of dead CRs and (when fired
+# with old image tags) wastes node disk on cached layers no longer referenced.
+#
+# This CronJob runs every 10 minutes, lists every Sandbox in `agents`, and
+# deletes any whose `metadata.creationTimestamp` is older than AGE_SEC (default
+# 30 min). Scoped by RBAC to the `agents` namespace only.
+#
+# Installed by `ops/install.sh` (idempotent — kubectl apply).
+
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: hive-gc
+  namespace: agents
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: hive-gc
+  namespace: agents
+rules:
+  - apiGroups: ["agents.x-k8s.io"]
+    resources: ["sandboxes"]
+    verbs: ["get", "list", "delete"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: hive-gc
+  namespace: agents
+subjects:
+  - kind: ServiceAccount
+    name: hive-gc
+    namespace: agents
+roleRef:
+  kind: Role
+  name: hive-gc
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: hive-gc
+  namespace: agents
+spec:
+  schedule: "*/10 * * * *"
+  concurrencyPolicy: Forbid           # one GC at a time — never overlap
+  successfulJobsHistoryLimit: 1       # keep only the most recent success log
+  failedJobsHistoryLimit: 2
+  startingDeadlineSeconds: 300
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      ttlSecondsAfterFinished: 300     # delete the Job itself 5min after it exits
+      template:
+        spec:
+          serviceAccountName: hive-gc
+          restartPolicy: OnFailure
+          containers:
+            - name: gc
+              # alpine/k8s ships kubectl + jq + curl — small enough (~80MB) and
+              # avoids us baking + maintaining a custom GC image.
+              image: alpine/k8s:1.30.0
+              env:
+                - name: AGE_SEC
+                  value: "1800"        # 30 min; override per cluster if you want
+              command: ["sh", "-c"]
+              args:
+                - |
+                  set -eu
+                  cutoff="$(date -u -d "@$(( $(date +%s) - AGE_SEC ))" +%Y-%m-%dT%H:%M:%SZ)"
+                  echo "[hive-gc] cutoff=$cutoff (age > ${AGE_SEC}s)"
+                  victims="$(kubectl -n agents get sandbox -o json 2>/dev/null \
+                    | jq -r --arg cutoff "$cutoff" \
+                        '.items[]? | select(.metadata.creationTimestamp < $cutoff) | .metadata.name')"
+                  if [ -z "$victims" ]; then
+                    echo "[hive-gc] nothing to delete"
+                    exit 0
+                  fi
+                  echo "$victims" | while read -r n; do
+                    if kubectl -n agents delete sandbox "$n" --ignore-not-found >/dev/null 2>&1; then
+                      echo "  ✓ $n"
+                    else
+                      echo "  ✗ $n"
+                    fi
+                  done
+              resources:
+                requests:
+                  cpu: "50m"
+                  memory: "64Mi"
+                limits:
+                  cpu: "200m"
+                  memory: "128Mi"

@@ -1,0 +1,54 @@
+{
+  "name": "@anupam/hive",
+  "version": "0.1.4",
+  "description": "Coding-agent fleet CLI — fire workers/qa from a GitHub issue against any repo. Runs on a local k8s sandbox.",
+  "publishConfig": {
+    "access": "public"
+  },
+  "bin": {
+    "hivectl": "bin/hivectl"
+  },
+  "files": [
+    "bin/hivectl",
+    "Makefile",
+    "assets/hive/",
+    "k8s-sandbox/run.sh",
+    "k8s-sandbox/README.md",
+    "k8s-sandbox/manifests/*.yaml",
+    "k8s-sandbox/image/Dockerfile",
+    "k8s-sandbox/image/*.sh",
+    "k8s-sandbox/image/*.mjs",
+    "k8s-sandbox/image/templates/*.md",
+    ".claude/agents/*.md",
+    ".claude/skills/**/*.md",
+    ".claude/labels.md",
+    ".claude/CLAUDE.md",
+    "ops/**/*.sh",
+    "ops/**/*.yaml",
+    "ops/**/*.json",
+    "ops/**/*.py",
+    "ops/README.md",
+    "ops-ui/*.py",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "bash bin/hivectl help >/dev/null"
+  },
+  "keywords": [
+    "claude-code",
+    "agents",
+    "coding-agent",
+    "kubernetes",
+    "github-issues",
+    "fleet"
+  ],
+  "author": "Anupam Kumar <anupamkumar19990505@gmail.com>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bear-o-bear/hive.git"
+  }
+}

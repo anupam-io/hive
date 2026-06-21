@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>hive · task types</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="wrap doc">
+
+  <nav class="top">
+    <a class="brand" href="index.html">hive</a>
+    <a href="architecture.html">Architecture</a>
+    <a href="cli.html">CLI</a>
+    <a href="task-types.html">Task types</a>
+    <a href="troubleshooting.html">Troubleshooting</a>
+  </nav>
+
+  <div class="kicker">Modes</div>
+  <h1>Four worker modes, <em>one qa role</em></h1>
+  <p class="lede">The <code>--type</code> on <code>hivectl fire</code> picks the worker's mode; the target repo
+  owns the per-type playbook (<code>&lt;app&gt;/.claude/skills/&lt;TYPE&gt;/</code>) and per-repo rules
+  (<code>&lt;app&gt;/.claude/CLAUDE.md</code>), which the pod auto-loads.</p>
+
+  <h2 id="worker"><span class="num">›</span>Worker modes</h2>
+  <div class="modes">
+    <div class="mode"><h3>feature-implementation</h3><p>Build a new capability from the issue's Plan + DoD.<br><code>type:feature</code></p></div>
+    <div class="mode"><h3>bug-fix</h3><p>Reproduce, fix the root cause, prove it with the DoD checklist.<br><code>type:bug</code></p></div>
+    <div class="mode"><h3>improvement</h3><p>Refactor / harden / tidy <em>without</em> changing behavior.<br><code>type:improvement</code></p></div>
+    <div class="mode"><h3>research</h3><p>Produce a findings document — <em>no code, no PR expected.</em><br><code>type:research</code></p></div>
+  </div>
+
+  <h2 id="qa"><span class="num">›</span>The qa role</h2>
+  <p>qa is fired separately (<code>hivectl qa --url=&lt;U&gt; [--target=&lt;ISSUE&gt;]</code>), runs on a browser-equipped
+  image, and drives the <b>running app</b> from the outside. It never reads source. Its only writes are QA
+  artifacts to an orphan branch <code>qa-artifacts/issue-&lt;N&gt;/&lt;ts&gt;/*</code> and a new <code>type:qa-feedback</code>
+  issue cross-linking the target. Those feedback issues re-enter the loop as ordinary work.</p>
+
+  <h2 id="conventions"><span class="num">›</span>Shared conventions</h2>
+  <p>Every fire, every type, obeys the same contract:</p>
+  <table>
+    <tr><th>Convention</th><th>Rule</th></tr>
+    <tr><td><code>## Definition of Done</code></td><td>Required. ≥1 verifiable <code>- [ ]</code> checklist line. Driver refuses to fire without one (no auto-stub).</td></tr>
+    <tr><td><code>## Plan</code></td><td>Required as authoritative scope. Driver may draft a <code>## Plan (proposed by driver)</code> block; a human renames it to plain <code>## Plan</code> to approve.</td></tr>
+    <tr><td>In-pod review</td><td>A fresh <code>claude</code> process grades the DoD and emits <code>REVIEW: PASS | CHANGES_REQUESTED</code>. PASS → driver merges; CHANGES_REQUESTED → driver re-fires.</td></tr>
+    <tr><td>Templates</td><td>PR body, status comments, needs-human comments, and per-type briefs all render from <code>k8s-sandbox/image/templates/</code> via <code>envsubst</code>.</td></tr>
+  </table>
+
+  <div class="note"><b>qa-feedback carve-out.</b> For <code>type:qa-feedback</code> issues only, the driver drafts the DoD (one verifiable line per concrete defect), since the qa finding text already is the human intent. Every other type keeps the no-auto-stub rule.</div>
+
+  <h2 id="labels"><span class="num">›</span>Type labels</h2>
+  <table>
+    <tr><th>Label</th><th>Meaning</th></tr>
+    <tr><td><code>type:feature</code></td><td>New feature implementation</td></tr>
+    <tr><td><code>type:bug</code></td><td>Bug fix</td></tr>
+    <tr><td><code>type:improvement</code></td><td>Refactor, polish, or quality work on existing code</td></tr>
+    <tr><td><code>type:research</code></td><td>Investigation / write-up only; no PR expected</td></tr>
+    <tr><td><code>type:qa-feedback</code></td><td>Filed by the qa role; cross-links the target issue</td></tr>
+  </table>
+  <p class="meta">Each issue carries exactly one <code>type:*</code> and one <code>status:*</code> label — see the <a href="architecture.html#lifecycle">lifecycle diagram</a>.</p>
+
+  <footer><a href="index.html">← back to hive</a></footer>
+</div>
+</body>
+</html>

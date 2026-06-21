@@ -1,0 +1,105 @@
+# One-shot coding agent: runs ONE GitHub issue against ONE repo, then exits.
+# Generic — point it at any repo. The task comes from the issue; the guardrails
+# come from that repo's CLAUDE.md. run.sh renders this template per fire:
+#
+#   AGENT_NAME=issue-42 ISSUE_NUMBER=42 REPO_URL=https://github.com/org/repo \
+#     ./k8s-sandbox/run.sh ...
+#
+# The actual `claude -p ... --dangerously-skip-permissions` call lives in
+# image/agent.sh (step 3). This manifest just launches it one-shot.
+apiVersion: agents.x-k8s.io/v1alpha1
+kind: Sandbox
+metadata:
+  name: coding-agent-${AGENT_NAME}
+  namespace: ${AGENTS_NAMESPACE}
+  labels:
+    app: "${APP}"                              # project identifier — hivectl tail/logs/metrics filter by this
+    app.kubernetes.io/name: coding-agent       # role identity within the fleet
+    app.kubernetes.io/instance: "${APP}"
+    issue_id: "${ISSUE_ID}"
+    task_type: "${TASK_TYPE}"
+    model: "${MODEL}"
+    role: "${ROLE}"
+spec:
+  # Delete the pod the moment its container exits. Logs are already tailed live
+  # by run.sh into <project>/.hive/runs/<run>/run.log (kubectl logs -f in the
+  # background) — there's nothing left on the pod worth retaining. The Sandbox
+  # CR itself is GC'd by the hive-gc CronJob (ops/hive-gc.yaml).
+  shutdownPolicy: Delete
+  podTemplate:
+    metadata:
+      labels:
+        app: "${APP}"                          # per-project scoping (hive filters on this)
+        app.kubernetes.io/name: coding-agent
+        app.kubernetes.io/instance: "${APP}"
+        issue_id: "${ISSUE_ID}"
+        agent: "${AGENT_NAME}"       # per-fire unique label; run.sh selects this
+        task_type: "${TASK_TYPE}"    # surfaced to kube-state-metrics for grouping
+        model: "${MODEL}"            # sonnet | opus | <override>
+        role: "${ROLE}"              # worker | reviewer
+    spec:
+      restartPolicy: Never          # one-shot: run once, do not rerun on exit
+      securityContext:
+        # Container runs as uid 1000 (`node`) so claude --dangerously-skip-permissions
+        # is allowed. fsGroup makes the PVC writable by that uid.
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      containers:
+        - name: agent
+          image: ${IMAGE_REPO}:${IMAGE_TAG}    # coding-agent (worker/reviewer) | web-qa-agent (qa)
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: ISSUE_NUMBER
+              value: "${ISSUE_NUMBER}"
+            - name: REPO_URL
+              value: "${REPO_URL}"
+            - name: TASK_TYPE
+              value: "${TASK_TYPE}"
+            - name: BASE_BRANCH
+              value: "${BASE_BRANCH}"
+            - name: MODEL
+              value: "${MODEL}"
+            - name: COST_LIMIT_USD
+              # Per-fire spend ceiling passed to claude code's native
+              # --max-budget-usd (agent.sh subtracts each hammer's cost so the
+              # cap is for the whole fire, not per call).
+              value: "${COST_LIMIT_USD}"
+            # qa-role inputs — empty for non-qa fires, ignored by agent.sh.
+            - name: WEB_URL
+              value: "${WEB_URL}"
+            - name: QA_TARGET
+              value: "${QA_TARGET}"
+            - name: PUSHGATEWAY_URL
+              value: "http://pushgateway.monitoring.svc.cluster.local:9091"
+            - name: ANTHROPIC_API_KEY
+              valueFrom:
+                secretKeyRef: { name: ${SECRET_NAME}, key: ANTHROPIC_API_KEY, optional: true }
+            - name: CLAUDE_CODE_OAUTH_TOKEN
+              valueFrom:
+                secretKeyRef: { name: ${SECRET_NAME}, key: CLAUDE_CODE_OAUTH_TOKEN, optional: true }
+            - name: GITHUB_PAT_TOKEN
+              valueFrom:
+                secretKeyRef: { name: ${SECRET_NAME}, key: GH_AUTH_TOKEN }
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+            - name: claude-oauth
+              mountPath: /auth
+              readOnly: true
+          resources:
+            # requests stay modest so the scheduler packs pods tightly;
+            # limits are role-based guardrails set by run.sh (worker: 1/2Gi,
+            # reviewer: 2/4Gi). Override per-fire with CPU_LIMIT / MEM_LIMIT.
+            requests: { cpu: "250m", memory: "512Mi", ephemeral-storage: "2Gi" }
+            limits: { cpu: "${CPU_LIMIT}", memory: "${MEM_LIMIT}" }
+      volumes:
+        - name: workspace               # scratch for git clone + claude's working files
+          emptyDir: {}
+        - name: claude-oauth
+          secret:
+            secretName: claude-oauth
+            optional: true
+            items:
+              - key: .credentials.json
+                path: .credentials.json

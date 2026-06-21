@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>hive · architecture</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="wrap doc">
+
+  <nav class="top">
+    <a class="brand" href="index.html">hive</a>
+    <a href="architecture.html">Architecture</a>
+    <a href="cli.html">CLI</a>
+    <a href="task-types.html">Task types</a>
+    <a href="troubleshooting.html">Troubleshooting</a>
+  </nav>
+
+  <div class="kicker">Design</div>
+  <h1>How a <em>fire</em> becomes a reviewed PR</h1>
+  <p class="lede">One <code>hivectl fire &lt;ISSUE&gt;</code> renders a per-fire pod that writes code, reviews
+  itself, and opens a PR — while everything stays scoped per project.</p>
+
+  <nav class="toc">
+    <strong>Contents</strong>
+    <ol>
+      <li><a href="#roles">Three roles</a></li>
+      <li><a href="#per-project">The per-project model</a></li>
+      <li><a href="#dod">Definition of Done &amp; Plan</a></li>
+      <li><a href="#review">The in-pod review contract</a></li>
+      <li><a href="#lifecycle">Issue lifecycle</a></li>
+      <li><a href="#sandbox">Sandbox &amp; image flow</a></li>
+      <li><a href="#models">Models &amp; caps</a></li>
+    </ol>
+  </nav>
+
+  <h2 id="roles"><span class="num">01</span>Three roles</h2>
+  <p>Two roles are ephemeral pods; the third is a local session. The pod that <em>writes</em> the code never <em>ships</em> it.</p>
+  <table>
+    <tr><th>Role</th><th>Where</th><th>Model</th><th>What it does</th></tr>
+    <tr><td><b>driver</b></td><td>local Claude Code session</td><td>Opus 4.8</td><td>Orchestrator, human-in-the-loop. Plans issues, fires workers and qa, reads verdicts, merges PRs, course-corrects. Never writes app code.</td></tr>
+    <tr><td><b>worker</b></td><td>ephemeral k8s pod</td><td>Sonnet</td><td>Does the work in one of four modes. Writes code, <b>self-reviews in the same pod</b>, opens a PR. Exits when done.</td></tr>
+    <tr><td><b>qa</b></td><td>ephemeral k8s pod</td><td>Sonnet</td><td>Drives the <b>running app</b> from the outside. Never clones or reads source. Files <code>type:qa-feedback</code> issues that re-enter the loop.</td></tr>
+  </table>
+  <div class="note"><b>No separate reviewer pod.</b> Review and merge are split between the worker (gates its own PR via a fresh in-pod review process) and the driver (performs the merge), so the author never ships its own code.</div>
+
+  <h2 id="per-project"><span class="num">02</span>The per-project model</h2>
+  <p><code>hivectl init</code> scaffolds <code>.hive/</code> from the package's <code>assets/hive/</code> template with placeholder substitution (app name, repo URL, kubectl context). Every later invocation reads <code>.hive/config.yaml</code> and tags what it creates with <code>app=&lt;that app&gt;</code>, so projects sharing one cluster never collide.</p>
+  <table>
+    <tr><th>Location</th><th>Owner</th><th>Holds</th></tr>
+    <tr><td><code>$HIVE_ROOT</code> (install dir)</td><td>read-only</td><td><code>bin/hivectl</code>, <code>Makefile</code>, <code>assets/</code>, <code>manifests/</code>, <code>ops/</code>, <code>driver.md</code>, <code>labels.md</code></td></tr>
+    <tr><td><code>$HIVE_STATE_DIR</code> (<code>$HOME/.hive</code>)</td><td>per-user</td><td>fallback <code>.env</code>, machine-wide bookkeeping</td></tr>
+    <tr><td><code>&lt;project&gt;/.hive/</code></td><td>per-project (gitignored)</td><td><code>config.yaml</code>, <code>runs/…/run.log</code>, <code>handoff/sprint-N.md</code></td></tr>
+  </table>
+  <p>Project-scoped commands bail with "run <code>hivectl init</code> first" when the cwd has no <code>.hive/config.yaml</code>; cluster-wide commands (<code>setup</code>, <code>doctor</code>, <code>init</code>, <code>help</code>, …) don't.</p>
+
+  <h2 id="dod"><span class="num">03</span>Definition of Done &amp; Plan</h2>
+  <h3>## Definition of Done</h3>
+  <p>≥1 verifiable <code>- [ ]</code> checklist line (a command that exits 0, an endpoint returning a known shape, files staying in scope). The driver <b>refuses to fire</b> without one and comments asking for it — <b>no auto-stub</b>, because an LLM-written DoD that's subtly wrong is worse than none.</p>
+  <div class="note"><b>Exception — type:qa-feedback.</b> Filed by qa against shipped work, so the finding text <em>is</em> the human intent. For these only, the driver drafts the DoD (one verifiable line per concrete defect). Every other type keeps the no-auto-stub rule.</div>
+  <h3>## Plan</h3>
+  <p>Goal, constraints, format of done, failure mode, files likely touched — the authoritative scope. The driver may draft a <code>## Plan (proposed by driver)</code> block and flip status to <code>needs-human</code>; a human renames the heading to plain <code>## Plan</code> to approve. The exact heading is load-bearing: <code>## Plan</code> fires, <code>## Plan (proposed by driver)</code> does not (the pod double-checks at startup).</p>
+
+  <h2 id="review"><span class="num">04</span>The in-pod review contract</h2>
+  <p>On worker success, a <b>second, fresh <code>claude</code> process</b> (no shared reasoning trail) reviews the change and gates it. It grades each DoD line, emits a <code>**DoD verdict**</code> table, and ends with a load-bearing verdict line:</p>
+  <pre><code>REVIEW: PASS | CHANGES_REQUESTED</code></pre>
+  <ul>
+    <li><code>PASS</code> → issue flips to <code>status:in-review</code>; the driver merges.</li>
+    <li><code>CHANGES_REQUESTED</code> → issue flips to <code>status:changes-requested</code>; the driver re-fires a worker, which reads the review's <code>**Changes requested:**</code> block.</li>
+  </ul>
+  <p>Every harness-posted body and model-filled brief renders from a template in <code>k8s-sandbox/image/templates/</code> via <code>envsubst</code> with a strict variable whitelist, so formatting never drifts between agents or fires.</p>
+
+  <h2 id="lifecycle"><span class="num">05</span>Issue lifecycle</h2>
+  <p>Each issue carries <b>exactly one</b> <code>status:*</code> and one <code>type:*</code> label (plus an optional <code>sprint-N</code>). Transitions always remove the old status label in the same edit — the mutex is driver-enforced and pod-double-checked.</p>
+  <div class="diagram">
+  <pre class="mermaid">
+stateDiagram-v2
+    [*] --> ready: triaged, has DoD + Plan
+    ready --> in_progress: driver fires a worker
+    in_progress --> in_review: review PASS
+    in_progress --> changes_requested: review CHANGES_REQUESTED
+    in_progress --> needs_human: blocked / open questions
+    changes_requested --> in_progress: driver re-fires
+    needs_human --> ready: human resolves
+    in_review --> done: driver merges PR
+    done --> [*]
+  </pre>
+  </div>
+
+  <h2 id="sandbox"><span class="num">06</span>Sandbox &amp; image flow</h2>
+  <p>A fire renders a per-fire Sandbox CR and applies it. Pods have <b>no docker socket, no kubectl, no hivectl</b> — they only edit files, push, comment on the PR, and update the issue via <code>gh</code>. Two images are built and imported into the cluster <b>once</b> by <code>hivectl agent-setup</code>:</p>
+  <div class="diagram">
+  <pre class="mermaid">
+flowchart LR
+  agentsetup["hivectl agent-setup"] -->|"build + import once"| coding["coding-agent<br/>worker · lean, no browser"]
+  agentsetup -->|"build + import once"| qaimg["web-qa-agent<br/>qa · + playwright + chromium"]
+  fire["hivectl fire"] -->|"references image already in cluster<br/>IfNotPresent — no rebuild"| pod[("Sandbox pod")]
+  coding -.-> pod
+  qaimg -.-> pod
+  </pre>
+  </div>
+  <p>A fire does <em>not</em> build or re-load — it references the image already in the cluster (<code>imagePullPolicy: IfNotPresent</code>), which shares the secret's lifecycle: recreate the cluster, then re-run <code>hivectl agent-setup</code>. Pods auto-clean (<code>shutdownPolicy: Delete</code>); the Sandbox CR is GC'd by <code>hive-gc</code> (every 10 min, age &gt; 30 min) or <code>hivectl gc</code>.</p>
+  <div class="note"><b>qa isolation.</b> The qa role <em>never reads source</em>: no clone, no <code>main</code> checkout. Its GH token only (a) pushes QA artifacts to an orphan branch <code>qa-artifacts/issue-&lt;N&gt;/&lt;ts&gt;/*</code> and (b) opens a <code>type:qa-feedback</code> issue. Never edits issues, opens PRs, or pushes elsewhere.</div>
+
+  <h2 id="models"><span class="num">07</span>Models &amp; caps</h2>
+  <table>
+    <tr><th></th><th>worker (all modes)</th><th>qa</th><th>driver</th></tr>
+    <tr><td>Model</td><td>Sonnet</td><td>Sonnet</td><td>Opus 4.8 (<code>claude-opus-4-8</code>)</td></tr>
+    <tr><td>CPU / memory limit</td><td>1 / 2Gi</td><td>2 / 4Gi</td><td>n/a (local)</td></tr>
+    <tr><td>Per-fire cost cap</td><td>$5 (coding + research)</td><td>$2</td><td><code>--budget</code> (default $10)</td></tr>
+  </table>
+  <p>The worker's in-pod review also runs Sonnet and carries its <b>own</b> $2 budget on top of the task cap; reported <code>cost_usd</code> = <code>primary_cost_usd</code> + <code>selfreview_cost_usd</code>. Never Fable 5, never Haiku. Caps are per-fire <em>ceilings</em>, not expected spend — overridable via <code>HIVE_DRIVER_MODEL</code> / <code>MODEL</code> / <code>COST_LIMIT_USD</code> / <code>CPU_LIMIT</code> / <code>MEM_LIMIT</code>.</p>
+
+  <footer><a href="index.html">← back to hive</a></footer>
+</div>
+
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid/dist/mermaid.esm.min.mjs';
+  mermaid.initialize({ startOnLoad:true, theme:'base', themeVariables:{
+    background:'#141b24', primaryColor:'#141b24', primaryTextColor:'#e8edf2',
+    primaryBorderColor:'#2dd4bf', lineColor:'#5c6878', secondaryColor:'#1b2530',
+    tertiaryColor:'#0b0f14', fontFamily:'IBM Plex Mono, monospace', fontSize:'14px'
+  }});
+</script>
+</body>
+</html>

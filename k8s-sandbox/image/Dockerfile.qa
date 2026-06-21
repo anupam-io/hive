@@ -1,0 +1,33 @@
+# web-qa-agent: the base coding-agent + Playwright + chromium, for the qa role.
+# Split out of the base image so workers/reviewers (the bulk of the fleet) don't
+# carry the ~1.18GB browser they never open. Built + loaded alongside the base
+# by `hivectl agent-setup` (ops/claude-code-setup.sh); run.sh selects this image
+# only for qa fires (ROLE=qa).
+FROM coding-agent:latest
+
+# The install needs root (apt --with-deps, npm -g, chown); base ends as `node`.
+USER root
+
+# Playwright + chromium + the official Playwright MCP server for the qa role.
+# Browsers go to a fixed path so the unprivileged node user can read them.
+# @playwright/mcp lets claude DRIVE the browser itself during analysis —
+# qa-capture.mjs (already in the base) only collects the small baseline it owns
+# (initial paint + console + network), the agent does the rest of the QA via MCP.
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+RUN npm install -g playwright @playwright/mcp \
+ && mkdir -p /ms-playwright \
+ && npx playwright install --with-deps chromium \
+ && chown -R node:node /ms-playwright \
+ # qa-capture.mjs lives at /usr/local/bin and does `import 'playwright'`.
+ # Node 22 ESM does NOT honour NODE_PATH reliably for global packages, but it
+ # DOES search /node_modules and /workspace/node_modules by default. Symlink
+ # the global installs there so the import resolves regardless of cwd.
+ # Sprint-1's whole QA bucket got zeroed by this missing one line.
+ && mkdir -p /node_modules \
+ && ln -sf /usr/local/lib/node_modules/playwright /node_modules/playwright \
+ && ln -sf /usr/local/lib/node_modules/@playwright /node_modules/@playwright \
+ && npm cache clean --force
+
+# Back to the unprivileged user the base set up (claude refuses
+# --dangerously-skip-permissions as root). ENTRYPOINT is inherited from base.
+USER node

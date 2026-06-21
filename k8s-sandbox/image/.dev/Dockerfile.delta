@@ -1,0 +1,39 @@
+# Fast iteration on top of an already-built coding-agent:latest. Only used
+# during a session where the heavy layers (chromium download via playwright,
+# apt install) already landed and we just want to add tools + ship script
+# updates without re-paying the slow base. The canonical Dockerfile is the
+# source of truth for clean rebuilds — this is a per-session shortcut.
+#
+# Build with:
+#   docker build -t coding-agent:latest -f Dockerfile.delta .
+FROM coding-agent:latest
+
+USER root
+
+# Extra apt tooling some workers asked for — build chain + native node deps.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      build-essential make python3 python3-pip \
+      postgresql-client unzip ripgrep wget \
+ && rm -rf /var/lib/apt/lists/*
+
+# bun — chain-monitor's package manager. Land it system-wide so PATH works
+# for uid 1000 (the `node` user the agent actually runs as).
+ENV BUN_INSTALL=/usr/local
+RUN curl -fsSL https://bun.sh/install | bash \
+ && ln -sf /usr/local/bin/bun /usr/local/bin/bunx \
+ && /usr/local/bin/bun --version
+
+# Globally-available tsc + the Playwright MCP server claude needs to drive
+# the browser itself during qa fires.
+RUN npm install -g typescript @playwright/mcp
+
+# Refresh the COPY'd scripts (qa-agent.sh + qa-capture.mjs got reshaped to
+# the agent-driven design; the others may have edits too).
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+COPY agent.sh /usr/local/bin/agent
+COPY qa-agent.sh /usr/local/bin/qa-agent
+COPY qa-capture.mjs /usr/local/bin/qa-capture.mjs
+RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/agent /usr/local/bin/qa-agent
+
+USER node

@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>hive · CLI reference</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="wrap doc">
+
+  <nav class="top">
+    <a class="brand" href="index.html">hive</a>
+    <a href="architecture.html">Architecture</a>
+    <a href="cli.html">CLI</a>
+    <a href="task-types.html">Task types</a>
+    <a href="troubleshooting.html">Troubleshooting</a>
+  </nav>
+
+  <div class="kicker">Reference</div>
+  <h1>The <em>hivectl</em> surface</h1>
+  <p class="lede"><code>hivectl &lt;command&gt; [args]</code>. <span class="scope s-proj">project</span> commands need
+  <code>.hive/config.yaml</code> (run <code>hivectl init</code> first); <span class="scope s-cluster">cluster-wide</span>
+  commands don't. Run <code>hivectl help</code> for the live list.</p>
+
+  <nav class="toc">
+    <strong>Groups</strong>
+    <ol>
+      <li><a href="#fleet">Fleet</a></li>
+      <li><a href="#driver">Driver</a></li>
+      <li><a href="#project">Project</a></li>
+      <li><a href="#cluster">Local cluster</a></li>
+      <li><a href="#infra">Infra setup</a></li>
+      <li><a href="#misc">Misc</a></li>
+    </ol>
+  </nav>
+
+  <h2 id="fleet"><span class="num">›</span>Fleet <span class="scope s-proj">project</span></h2>
+  <table>
+    <tr><th>Command</th><th>What</th></tr>
+    <tr><td><code>fire &lt;ISSUE&gt; --type=&lt;T&gt; [--repo=&lt;URL&gt;] [--base=&lt;BR&gt;]</code></td><td>Fire a worker against GitHub ISSUE (a number or <code>issue-N</code>). <code>T</code>: <code>feature-implementation</code> | <code>bug-fix</code> | <code>improvement</code> | <code>research</code>. Repo precedence: <code>--repo</code> &gt; config's <code>repo</code>.</td></tr>
+    <tr><td><code>qa --url=&lt;U&gt; [--target=&lt;ISSUE&gt;]</code></td><td>Fire a qa agent against a deployed URL. Optionally cross-links a target issue.</td></tr>
+    <tr><td><code>merge &lt;ISSUE&gt; [--repo=&lt;URL&gt;] [--base=&lt;BR&gt;] [--force]</code></td><td>Merge <code>agent/issue-&lt;N&gt;</code>'s reviewed PR locally (via <code>gh</code>, no pod). Refuses unless the issue is <code>status:in-review</code>.</td></tr>
+    <tr><td><code>status &lt;ISSUE&gt; &lt;STATUS&gt;</code></td><td>Set an issue's <code>status:*</code> label, enforcing the mutex. STATUS: <code>ready</code> | <code>in-progress</code> | <code>in-review</code> | <code>changes-requested</code> | <code>done</code> | <code>needs-human</code>.</td></tr>
+    <tr><td><code>tail &lt;ISSUE&gt;</code></td><td>Live-tail the running pod's stdout (filtered by <code>app=</code>).</td></tr>
+    <tr><td><code>logs</code></td><td>List this project's run dirs.</td></tr>
+    <tr><td><code>metrics [ISSUE]</code></td><td>Cost / tokens / duration table.</td></tr>
+    <tr><td><code>ui</code></td><td>Open the agent run-analytics UI (port auto-picks from 8001).</td></tr>
+    <tr><td><code>expose</code></td><td>Port-forward prometheus + headlamp + the configured app, and start the analytics UI — one process, Ctrl-C stops all.</td></tr>
+  </table>
+
+  <h2 id="driver"><span class="num">›</span>Driver <span class="scope s-proj">project</span></h2>
+  <table>
+    <tr><th>Command</th><th>What</th></tr>
+    <tr><td><code>driver [--once] [--budget=&lt;USD&gt;] [--sleep=&lt;s&gt;] [--repo=&lt;path&gt;]</code></td><td><b>AUTO (default):</b> unattended loop — picks the current sprint and drives it to completion, streaming output, relaunching a fresh session on each context-limit handoff / per-session budget cap. <code>--once</code> one session · <code>--budget</code> per-session $ cap (default 10) · <code>--interactive</code> human-driven session.</td></tr>
+  </table>
+
+  <h2 id="project"><span class="num">›</span>Project <span class="scope s-proj">project</span></h2>
+  <table>
+    <tr><th>Command</th><th>What</th></tr>
+    <tr><td><code>init</code></td><td>Scaffold <code>.hive/config.yaml</code> in cwd (idempotent). Also writes <code>.hive/.gitignore</code>.</td></tr>
+    <tr><td><code>config [get &lt;k&gt; | set &lt;k&gt;=&lt;v&gt;]</code></td><td>Print resolved config; or read / edit one key.</td></tr>
+    <tr><td><code>labels [sync | list]</code></td><td>Sync the canonical <code>labels.md</code> dictionary into the project's GitHub repo (idempotent).</td></tr>
+    <tr><td><code>gc [--age=30m] [--all]</code></td><td>Delete this project's Sandbox CRs older than <code>--age</code> in the agents namespace.</td></tr>
+  </table>
+
+  <h2 id="cluster"><span class="num">›</span>Local cluster <span class="scope s-cluster">cluster-wide</span></h2>
+  <p class="meta">Mac dev only — minikube + vfkit. Single node, profile / kubectl context = <code>local-cluster</code>.</p>
+  <table>
+    <tr><th>Command</th><th>What</th></tr>
+    <tr><td><code>local-cluster-up</code></td><td>Spin up the <code>local-cluster</code> minikube cluster. Resize at first start via env, e.g. <code>DISK=80g MEMORY=16384 hivectl local-cluster-up</code>.</td></tr>
+    <tr><td><code>local-cluster-down</code></td><td>Delete the <code>local-cluster</code> minikube cluster.</td></tr>
+  </table>
+
+  <h2 id="infra"><span class="num">›</span>Infra setup <span class="scope s-cluster">cluster-wide</span></h2>
+  <table>
+    <tr><th>Command</th><th>What</th></tr>
+    <tr><td><code>bootstrap</code></td><td>One-shot fresh-machine setup: <code>doctor → local-cluster-up → setup</code> (stops on first failure).</td></tr>
+    <tr><td><code>doctor</code></td><td>Check host CLIs and print install hints.</td></tr>
+    <tr><td><code>setup</code></td><td>Install metrics-server + prometheus + sandbox CRDs + headlamp + hive-gc.</td></tr>
+    <tr><td><code>agent-setup</code> <span class="scope s-proj">project</span></td><td>Build the pod images + create the <code>&lt;app&gt;-creds</code> k8s secret from <code>.env</code>.</td></tr>
+  </table>
+
+  <h2 id="misc"><span class="num">›</span>Misc <span class="scope s-cluster">cluster-wide</span></h2>
+  <table>
+    <tr><th>Command</th><th>What</th></tr>
+    <tr><td><code>version</code> (<code>-v</code> / <code>--version</code>)</td><td>Print the hive version (from package.json).</td></tr>
+    <tr><td><code>root</code></td><td>Print the resolved install dir (<code>$HIVE_ROOT</code>).</td></tr>
+    <tr><td><code>help</code></td><td>The usage message.</td></tr>
+  </table>
+
+  <footer><a href="index.html">← back to hive</a></footer>
+</div>
+</body>
+</html>

@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>hive · coding-agent fleet</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="wrap">
+
+  <nav class="top">
+    <a class="brand" href="index.html">hive</a>
+    <a href="architecture.html">Architecture</a>
+    <a href="cli.html">CLI</a>
+    <a href="task-types.html">Task types</a>
+    <a href="troubleshooting.html">Troubleshooting</a>
+  </nav>
+
+  <div class="kicker">Coding-agent fleet</div>
+  <h1>Ship your backlog <em>while you sleep</em></h1>
+  <p class="lede">Point <b>hivectl</b> at an issue and it runs Claude Code in a throwaway Kubernetes pod
+  that opens a pull request. It's <b>per-project</b> — run it inside an app repo and every pod, secret,
+  and log is scoped to that project, so one cluster hosts fleets for many repos at once. The tracker is
+  <b>GitHub Issues in the same repo as the code</b>; each issue's <b>Definition of Done</b> and <b>Plan</b>
+  are the authoritative success criteria.</p>
+
+  <div class="flow">
+
+    <div class="flow-node n-human" style="--c:var(--accent2)">
+      <span class="ic">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="8" r="4"/><path d="M4 21c0-4 3.6-6 8-6s8 2 8 6"/>
+        </svg>
+      </span>
+      <div class="txt"><b>Hooman</b><span>files issues · approves plans · merges</span></div>
+    </div>
+
+    <div class="flow-link bi">
+      <span class="rail"></span>
+      <span class="cap">issues · approvals · merges</span>
+    </div>
+
+    <div class="flow-node n-driver hub" style="--c:var(--accent)">
+      <span class="ic">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="9"/><path d="M16.2 7.8l-2.5 6-6 2.5 2.5-6z"/>
+        </svg>
+      </span>
+      <div class="txt"><b>Driver</b><span class="model">opus 4.8</span><span>long-running orchestrator · human-in-the-loop</span></div>
+    </div>
+
+    <div class="flow-spokes">
+
+      <div class="spoke">
+        <div class="connector two">
+          <span class="step down"><i>1</i>fire a worker on a ready issue</span>
+          <span class="step up"><i>2</i>writes code, self-reviews in-pod, opens a PR</span>
+        </div>
+        <div class="flow-node n-worker" style="--c:var(--accent)">
+          <span class="ic">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="5" y="8" width="14" height="11" rx="2.5"/><path d="M12 8V4.5M12 4.5a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3z"/><circle cx="9" cy="13" r="1.1" fill="currentColor" stroke="none"/><circle cx="15" cy="13" r="1.1" fill="currentColor" stroke="none"/><path d="M2.5 12v3M21.5 12v3"/>
+            </svg>
+          </span>
+          <div class="txt"><b>Worker</b><span class="model">sonnet · ephemeral pod</span><span>feature-implementation · bug-fix · improvement · research</span></div>
+        </div>
+        <div class="loop"><span class="arc"></span>loop · re-fire a worker to fix</div>
+      </div>
+
+      <div class="spoke">
+        <div class="connector">
+          <span class="step down"><i>3</i>merges the PR once the self-review passed</span>
+        </div>
+        <div class="flow-node n-shipped" style="--c:#56d364">
+          <span class="ic">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M12 3c3 1.5 5 5 5 9l-2.2 2.2H9.2L7 12c0-4 2-7.5 5-9z"/><circle cx="12" cy="9.5" r="1.6"/><path d="M9.2 14.2L7 18l2.4-.6M14.8 14.2L17 18l-2.4-.6"/>
+            </svg>
+          </span>
+          <div class="txt"><b>Shipped to main</b><span>the merged PR is live</span></div>
+        </div>
+      </div>
+
+      <div class="spoke">
+        <div class="connector two">
+          <span class="step down"><i>4</i>fire qa against the live app</span>
+          <span class="step up"><i>5</i>files qa-feedback issues</span>
+        </div>
+        <div class="flow-node n-qa" style="--c:#a78bfa">
+          <span class="ic">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="10.5" cy="10.5" r="6"/><path d="M15 15l5 5"/>
+            </svg>
+          </span>
+          <div class="txt"><b>QA</b><span class="model">sonnet · ephemeral pod</span><span>drives the running app · never reads source</span></div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <div class="grid">
+    <a class="card" href="architecture.html">
+      <span class="pill">Design</span>
+      <h3>Architecture</h3>
+      <p>Roles, the in-pod review gate, DoD &amp; Plan, the k8s sandbox, image flow, the label lifecycle, spend caps.</p>
+      <div class="go">read the design →</div>
+    </a>
+    <a class="card" href="cli.html">
+      <span class="pill">Reference</span>
+      <h3>CLI reference</h3>
+      <p>Every <code>hivectl</code> command, grouped: fleet, driver, project, local cluster, infra setup.</p>
+      <div class="go">open the reference →</div>
+    </a>
+    <a class="card" href="task-types.html">
+      <span class="pill">Modes</span>
+      <h3>Task types</h3>
+      <p>The four worker modes plus qa — what each does, and the DoD / Plan / template conventions they share.</p>
+      <div class="go">see the modes →</div>
+    </a>
+    <a class="card" href="troubleshooting.html">
+      <span class="pill">Runbook</span>
+      <h3>Troubleshooting</h3>
+      <p>Image pulls, LoadBalancer on Mac, cost caps, missing DoD/Plan, recreating the cluster.</p>
+      <div class="go">open the runbook →</div>
+    </a>
+  </div>
+
+  <h2><span class="num">›</span>Install &amp; quickstart</h2>
+  <pre><code>npm i -g @anupam/hive          # installs the `hivectl` command
+
+# one-time, per machine
+hivectl bootstrap              # doctor → local-cluster-up → setup
+
+# one-time, per project
+cd ~/my-app
+hivectl init                   # scaffold .hive/config.yaml
+hivectl labels sync            # push status:*/type:* labels into the repo
+hivectl agent-setup            # build the pod image + create the creds secret
+
+# fire the fleet
+hivectl fire 42 --type=feature-implementation
+hivectl tail 42                # live-tail the pod
+hivectl merge 42               # merge issue #42's reviewed PR
+hivectl driver                 # hands-off orchestration loop</code></pre>
+  <p class="meta">Requirements (run <code>hivectl doctor</code>): <code>kubectl</code>, <code>docker</code>, <code>jq</code>, <code>yq</code>, <code>gh</code>, <code>envsubst</code>, <code>claude</code>. Local cluster on macOS: <code>minikube</code> + <code>vfkit</code>.</p>
+
+  <footer>hive · coding-agent fleet · <a href="architecture.html">architecture</a></footer>
+</div>
+</body>
+</html>

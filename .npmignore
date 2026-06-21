@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.agents/
+.env
+.env.*
+secret.txt
+auth.json
+state.md
+.DS_Store

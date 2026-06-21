@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>hive · troubleshooting</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="wrap doc">
+
+  <nav class="top">
+    <a class="brand" href="index.html">hive</a>
+    <a href="architecture.html">Architecture</a>
+    <a href="cli.html">CLI</a>
+    <a href="task-types.html">Task types</a>
+    <a href="troubleshooting.html">Troubleshooting</a>
+  </nav>
+
+  <div class="kicker">Runbook</div>
+  <h1>When a fire <em>misbehaves</em></h1>
+  <p class="lede">Common failure modes and what they mean. Start with <code>hivectl doctor</code> (host CLIs) and
+  <code>hivectl tail &lt;ISSUE&gt;</code> (live pod stdout — the only path from pod to your Mac).</p>
+
+  <details class="item">
+    <summary>Pod stuck in <code>ImagePullBackOff</code> <span class="sym">— after recreating the cluster</span></summary>
+    <p>The two images are built and imported into the cluster <b>once</b> by <code>hivectl agent-setup</code>, and a fire only references them (<code>imagePullPolicy: IfNotPresent</code>) — it never rebuilds. The images share the secret's lifecycle, so a fresh cluster has neither.</p>
+    <pre><code>hivectl agent-setup     # rebuild + re-import coding-agent and web-qa-agent</code></pre>
+  </details>
+
+  <details class="item">
+    <summary>A LoadBalancer service has no external IP <span class="sym">— app unreachable on Mac</span></summary>
+    <p>minikube has no built-in load balancer. Expose services manually:</p>
+    <pre><code>minikube tunnel -p local-cluster      # in a separate terminal, or:
+kubectl port-forward svc/&lt;svc&gt; &lt;port&gt;:&lt;port&gt;</code></pre>
+    <p>Or use <code>hivectl expose</code> to port-forward prometheus + headlamp + the configured app at once.</p>
+  </details>
+
+  <details class="item">
+    <summary>The driver refuses to fire an issue <span class="sym">— "DoD missing"</span></summary>
+    <p>Every issue needs a <code>## Definition of Done</code> H2 with at least one verifiable <code>- [ ]</code> line. The driver will <b>not</b> auto-stub one — it comments asking for it. Add the section and set the issue back to <code>status:ready</code>. (Exception: <code>type:qa-feedback</code> issues, where the driver drafts the DoD itself.)</p>
+  </details>
+
+  <details class="item">
+    <summary>An issue is stuck in <code>needs-human</code> with a <code>## Plan (proposed by driver)</code> block</summary>
+    <p>The exact heading is load-bearing: <code>## Plan</code> fires, <code>## Plan (proposed by driver)</code> does not (the pod double-checks at startup). A human reviews the proposed plan, renames the heading to plain <code>## Plan</code>, and flips status back to <code>ready</code>.</p>
+  </details>
+
+  <details class="item">
+    <summary>A fire stopped early with <code>cost_cap_hit:true</code></summary>
+    <p>Each fire has a per-task USD ceiling ($5 for coding modes + research, $2 for qa), plus a separate $2 for the worker's in-pod review. It's a <em>ceiling</em>, not a budget. Raise it per-fire:</p>
+    <pre><code>COST_LIMIT_USD=8 hivectl fire 42 --type=feature-implementation</code></pre>
+    <p>Or set <code>defaults.cost_limit_usd</code> in <code>.hive/config.yaml</code> as a flat project override.</p>
+  </details>
+
+  <details class="item">
+    <summary>A pod was OOM-killed or throttled</summary>
+    <p>Per-role <code>limits</code> are guardrails: worker <code>cpu=1, memory=2Gi</code>; qa <code>cpu=2, memory=4Gi</code>. k8s OOM-kills past memory, throttles past CPU. Override per-fire:</p>
+    <pre><code>MEM_LIMIT=4Gi CPU_LIMIT=2 hivectl fire 42 --type=feature-implementation</code></pre>
+  </details>
+
+  <details class="item">
+    <summary><code>hivectl &lt;cmd&gt;</code> says "run <code>hivectl init</code> first"</summary>
+    <p>Project-scoped commands resolve <code>.hive/config.yaml</code> strictly from the current directory — there's no walk-up. <code>cd</code> into the project root (where <code>.hive/</code> lives), or run <code>hivectl init</code> to scaffold it.</p>
+  </details>
+
+  <details class="item">
+    <summary><code>merge</code> refuses with a status error</summary>
+    <p><code>hivectl merge</code> only merges an issue at <code>status:in-review</code> (i.e. the in-pod review returned PASS). If the review returned CHANGES_REQUESTED, the issue is <code>status:changes-requested</code> and a worker must be re-fired first. Use <code>--force</code> only when you've verified the PR manually.</p>
+  </details>
+
+  <details class="item">
+    <summary>Dead Sandbox CRs piling up</summary>
+    <p>Pods self-delete on exit (<code>shutdownPolicy: Delete</code>); the Sandbox CRs are GC'd by the <code>hive-gc</code> CronJob (every 10 min, age &gt; 30 min). To clean this project's now:</p>
+    <pre><code>hivectl gc                 # age &gt; 30m
+hivectl gc --age=0m --all  # everything for this app</code></pre>
+  </details>
+
+  <details class="item">
+    <summary>Missing host CLI</summary>
+    <p>Run the preflight — it reports each tool and an install hint, and marks <code>minikube</code>/<code>vfkit</code> as optional (only needed for the local cluster):</p>
+    <pre><code>hivectl doctor</code></pre>
+  </details>
+
+  <footer><a href="index.html">← back to hive</a></footer>
+</div>
+</body>
+</html>
