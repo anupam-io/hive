@@ -1,6 +1,6 @@
 {
-  "name": "@anupam/hive",
-  "version": "0.1.4",
+  "name": "@anupam-io/hive",
+  "version": "0.1.0",
   "description": "Coding-agent fleet CLI — fire workers/qa from a GitHub issue against any repo. Runs on a local k8s sandbox.",
   "publishConfig": {
     "access": "public"
@@ -19,7 +19,7 @@
     "k8s-sandbox/image/*.sh",
     "k8s-sandbox/image/*.mjs",
     "k8s-sandbox/image/templates/*.md",
-    ".claude/agents/*.md",
+    ".claude/agents/driver.md",
     ".claude/skills/**/*.md",
     ".claude/labels.md",
     ".claude/CLAUDE.md",
@@ -49,6 +49,6 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/bear-o-bear/hive.git"
+    "url": "git+https://github.com/anupam-io/hive.git"
   }
 }

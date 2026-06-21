@@ -27,7 +27,7 @@ Keep it tight; no marketing fluff.
 1. `bash bin/hivectl help` exits 0.
 2. `grep -rin 'heiv\|spidey\|sp-core' . --exclude-dir=.git | grep -v hive-` → 0.
 3. `grep -rn 'HEIV_' . --exclude-dir=.git` → 0.
-4. `bash bin/hivectl version` → `0.1.4`.
+4. `bash bin/hivectl version` → `0.1.0`.
 5. `npm pack --dry-run` file list reviewed — clean tree, no scratch/secrets.
 
 ## Hand-off to user

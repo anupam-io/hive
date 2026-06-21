@@ -149,30 +149,26 @@ fi
 
 # Thin pointer. The method + report format live in the hive-qa skill; the
 # prompt carries only the dynamic bits (target URL, baseline artifact paths,
-# the issue under verification) plus the load-bearing RESULT marker.
-PROMPT="Follow the \`hive-qa\` skill — it defines the QA method and the report format.
-
-Target app: ${WEB_URL}
-${QA_TARGET_NUM:+Issue being verified: #${QA_TARGET_NUM}
+# the issue under verification) plus the load-bearing RESULT marker. The body
+# lives in templates/qa-prompt.md; a missing template would silently truncate
+# the prompt, so treat that as FATAL.
+TEMPLATES_DIR="${HIVE_TEMPLATES_DIR:-/opt/hive/templates}"
+QA_PROMPT_VARS='$WEB_URL $QA_TARGET_LINE $SHOT_LIST $PAGE_TXT $CONSOLE_LOG $NETWORK_LOG $META_JSON'
+render_prompt() {  # render_prompt <basename.md>
+  local path="$TEMPLATES_DIR/$1"
+  [ -r "$path" ] || { echo "[qa] FATAL: prompt template missing: $path" >&2; exit 1; }
+  envsubst "$QA_PROMPT_VARS" < "$path"
 }
-Baseline capture from a prior Playwright run — read with the Read tool (Read
-supports PNG images):
 
-${SHOT_LIST}- ${PAGE_TXT} — rendered document.body.innerText
-- ${CONSOLE_LOG} — every browser console event during load
-- ${NETWORK_LOG} — every failed request / non-2xx response during load
-- ${META_JSON} — capture metadata + any baseline errors
+# envsubst can't do the ${VAR:+…} conditional, so precompute the optional issue
+# line (trailing newline included) here to keep the rendered layout identical.
+QA_TARGET_LINE=""
+if [ -n "$QA_TARGET_NUM" ]; then
+  QA_TARGET_LINE="Issue being verified: #${QA_TARGET_NUM}"$'\n'
+fi
 
-You also have a LIVE Playwright browser via the playwright MCP — drive it
-yourself to do everything the baseline can't show you (navigate to ${WEB_URL},
-scroll below the fold, hover/click interactive elements, resize to a mobile
-viewport, visit every route, screenshot whenever it sharpens a claim). Live
-interaction is the heart of the job; the baseline only exists for
-console/network grounding.
-
-Do NOT run git or gh — the harness publishes your report as the feedback issue.
-End your reply with exactly one line:
-RESULT: REPORTED"
+export WEB_URL QA_TARGET_LINE SHOT_LIST PAGE_TXT CONSOLE_LOG NETWORK_LOG META_JSON
+PROMPT="$(render_prompt qa-prompt.md)"
 
 CLAUDE_OUT=/tmp/qa.out
 : > "$CLAUDE_OUT"

@@ -31,7 +31,7 @@ two are new.
 
 ## Gate
 - `bash bin/hivectl help` lists `version` and `bootstrap`.
-- `bash bin/hivectl version` prints `0.1.4`.
+- `bash bin/hivectl version` prints `0.1.0`.
 - `bootstrap` dispatch chain traced (cluster steps need a host; dry-verify
   the ordering + early-exit if headless).
 
