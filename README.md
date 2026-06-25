@@ -65,7 +65,7 @@ macOS: `minikube` + `vfkit`.
 ## Install
 
 ```bash
-npm i -g @anupam/hive   # installs the `hivectl` command
+npm i -g @anupam-io/hive   # installs the `hivectl` command
 ```
 
 ## Quickstart
